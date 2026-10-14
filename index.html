@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#1b1e22">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <title>驚喜製造機</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="apple-touch-icon" href="icon-192.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="app">
+    <h1>驚喜製造機</h1>
+
+    <section class="sign" aria-live="polite">
+      <div class="row"><span>題庫狀態</span><b id="dbStatus">載入中…</b></div>
+      <div class="row"><span>GPS 狀態</span><b id="gpsStatus">尚未啟動</b></div>
+      <div class="row"><span>播報狀態</span><b id="broadcastStatus">待命</b></div>
+      <div class="row"><span>播報語音</span><select id="voiceSelect" aria-label="播報語音"></select></div>
+      <div class="next">
+        <span>下個驚喜還有</span>
+        <strong id="nextDist">--</strong>
+      </div>
+    </section>
+
+    <div class="actions">
+      <button id="btnStart" class="primary">啟動系統</button>
+      <button id="btnTest">測試語音播報</button>
+      <button id="btnReset" class="reset">重置播報進度</button>
+    </div>
+
+    <p id="log" class="log"></p>
+  </main>
+
+  <audio id="chime" src="chime.mp3" preload="auto" hidden></audio>
+  <audio id="countdown" src="countdown.mp3" preload="auto" hidden></audio>
+
+  <script src="app.js"></script>
+</body>
+</html>
