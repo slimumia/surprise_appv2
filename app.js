@@ -1,13 +1,14 @@
-/* 驚喜製造機 app.js */
+/* 驚喜製造機 app.js (支援 YunJhe MP3 優先播放 + 內建 TTS 自動備援) */
 
 // ★ 貼上 Code.gs 部署後的「網頁應用程式網址」（結尾為 /exec）
 const API_URL = 'https://script.google.com/macros/s/AKfycbwdOJ2Cve8l2c5WAq65KyyvnpXarwo9N3oDoLhhAFRiRzAMKWh5Q6-nTTXu1W0MWFPABA/exec';
 
+const AUDIO_DIR = 'audio';           // 存放預錄 MP3 的資料夾名稱
 const COOLDOWN_MS = 3 * 60 * 1000;   // 冷知識冷卻：上一次播報結束後 3 分鐘
 const COUNTDOWN_MS = 15 * 1000;      // 思考倒數 15 秒
 // 越前面權重越高；涵蓋 Apple（Premium/Enhanced/Siri/Mei-Jia）、Edge（Natural/Online）、Chrome（Google 網路語音）
 const VOICE_KEYS = ['Premium', 'Enhanced', 'Siri', 'Natural', 'Neural', 'Online', 'Google', 'Ting-Ting', 'Mei-Jia', 'Meijia', '美佳', '臺灣', '台灣'];
-const VOICE_PREF = 'voice_pref';   // 使用者手動鎖定的語音（voiceURI）
+const VOICE_PREF = 'voice_pref';     // 使用者手動鎖定的語音（voiceURI）
 const KEY = { pois: 'played_pois', facts: 'played_facts', cache: 'offline_cache' };
 
 const $ = id => document.getElementById(id);
@@ -20,6 +21,10 @@ let isBroadcasting = false;   // 播報鎖，防止多重觸發
 let lastEnd = 0;              // 上一次播報結束時間
 let voice = null, watchId = null, wakeLock = null, audioCtx = null, started = false;
 window.speechUtterances = []; // 防止長文字被垃圾回收而中斷
+
+// 專用預錄 MP3 語音播放器
+const ttsAudio = new Audio();
+ttsAudio.preload = 'auto';
 
 /* ---------- LocalStorage ---------- */
 const store = {
@@ -39,7 +44,13 @@ async function loadDB() {
     clearTimeout(timer);
     const json = await res.json();
     if (json.status !== 'success') throw new Error(json.message || 'API 錯誤');
-    db = { pois: json.data.pois || [], facts: json.data.facts || [] };
+    
+    // 自動相容單一陣列或 { pois, facts } 雙工作表結構
+    if (Array.isArray(json.data)) {
+      db = { pois: json.data, facts: [] };
+    } else {
+      db = { pois: json.data.pois || [], facts: json.data.facts || [] };
+    }
     store.set(KEY.cache, db);
     ui('dbStatus', `線上 ✓ 景點 ${db.pois.length}／冷知識 ${db.facts.length}`);
   } catch (e) {
@@ -53,7 +64,7 @@ async function loadDB() {
   }
 }
 
-/* ---------- 高音質語音鎖定 ---------- */
+/* ---------- 高音質語音鎖定（作為無 MP3 時的備援語音）---------- */
 function scoreVoice(v) {
   let s = 0;
   VOICE_KEYS.forEach((k, i) => { if (v.name.includes(k)) s += 100 - i; });
@@ -73,12 +84,12 @@ function pickVoice() {
   const all = speechSynthesis.getVoices();
   if (!all.length) return;                   // 語音清單尚未載入，等 onvoiceschanged
   const tw = all.filter(v => /(zh|cmn)[-_]TW/i.test(v.lang));
-  const pool = tw.length ? tw : all.filter(v => /^(zh|cmn)/i.test(v.lang)); // 沒有台灣語音才退到其他中文
+  const pool = tw.length ? tw : all.filter(v => /^(zh|cmn)/i.test(v.lang));
   const saved = store.get(VOICE_PREF, null);
   voice = all.find(v => v.voiceURI === saved)
     || [...pool].sort((a, b) => scoreVoice(b) - scoreVoice(a))[0] || null;
   fillVoiceList(pool.length ? pool : all);
-  log(voice ? `語音：${voice.name}（${voice.lang}）` : '找不到中文語音，使用系統預設');
+  log(voice ? `備援語音：${voice.name}（優先播放預錄 MP3）` : '優先播放預錄 MP3（無中文備援語音）');
 }
 
 /* ---------- 解鎖音訊 / 語音 / 螢幕常亮（必須在點擊事件中呼叫）---------- */
@@ -100,7 +111,14 @@ async function unlockMedia() {
     speechSynthesis.speak(u);
   } catch { /* 不支援 TTS */ }
 
-  await Promise.all([$('chime'), $('countdown')].map(a => {
+  // 解鎖预錄 MP3 播放器 (ttsAudio) 與背景音效 (chime, countdown)
+  try {
+    ttsAudio.src = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
+    await ttsAudio.play();
+    ttsAudio.pause();
+  } catch { /* 忽略初始解鎖錯誤 */ }
+
+  await Promise.all([$('chime'),$('countdown')].map(a => {
     a.muted = true;
     return a.play().then(() => { a.pause(); a.currentTime = 0; }).catch(() => {}).finally(() => { a.muted = false; });
   }));
@@ -113,10 +131,10 @@ async function lockScreen() {
   } catch (e) { log('螢幕常亮失敗：' + e.message); }
 }
 document.addEventListener('visibilitychange', () => {
-  if (started && document.visibilityState === 'visible') lockScreen(); // 切回 App 時重新申請
+  if (started && document.visibilityState === 'visible') lockScreen();
 });
 
-/* ---------- 音效 / TTS ---------- */
+/* ---------- 音效 / MP3 優先播報 / TTS 備援 ---------- */
 function playAudio(el, loop = false) {
   el.loop = loop;
   el.currentTime = 0;
@@ -126,8 +144,8 @@ function playAudio(el, loop = false) {
 function speak(text) {
   return new Promise(resolve => {
     const u = new SpeechSynthesisUtterance(text);
-    if (!voice) pickVoice();                 // 語音可能在首次播報後才載入
-    u.lang = voice ? voice.lang : 'zh-TW';   // lang 與 voice 一致，避免部分瀏覽器被切回系統預設語音
+    if (!voice) pickVoice();
+    u.lang = voice ? voice.lang : 'zh-TW';
     if (voice) u.voice = voice;
     u.rate = 0.92;
     u.pitch = 1.05;
@@ -137,10 +155,47 @@ function speak(text) {
       window.speechUtterances = window.speechUtterances.filter(x => x !== u);
       resolve();
     };
-    const guard = setTimeout(done, text.length * 500 + 8000); // 瀏覽器漏發 onend 時的保險
+    const guard = setTimeout(done, text.length * 500 + 8000);
     u.onend = done;
     u.onerror = done;
     speechSynthesis.speak(u);
+  });
+}
+
+// ★ 核心雙軌播放：優先尋找 audio/<名稱>_<q|a>.mp3，若無檔案則自動切換為 speak() 備援
+function playMp3OrSpeak(itemName, part, fallbackText) {
+  return new Promise(resolve => {
+    const fileName = `${ String(itemName).trim() }_${part}.mp3`;
+    const mp3Url = `${AUDIO_DIR}/${encodeURIComponent(String(itemName).trim())}_${part}.mp3`;
+
+    const cleanup = () => {
+      ttsAudio.onloadeddata = null;
+      ttsAudio.onended = null;
+      ttsAudio.onerror = null;
+    };
+
+    const fallbackToTTS = async () => {
+      cleanup();
+      ui('broadcastStatus', `🗣️ 內建語音：${itemName}`, 'warn');
+      log(`未找到 ${fileName}，已自動切換為內建語音備援`);
+      await speak(fallbackText);
+      resolve();
+    };
+
+    ttsAudio.onloadeddata = () => {
+      ui('broadcastStatus', `🔊 MP3 播報：${itemName}`, 'warn');
+      log(`正在播放預錄音檔：${fileName}`);
+    };
+
+    ttsAudio.onended = () => {
+      cleanup();
+      resolve();
+    };
+
+    ttsAudio.onerror = fallbackToTTS;
+
+    ttsAudio.src = mp3Url;
+    ttsAudio.play().catch(fallbackToTTS);
   });
 }
 
@@ -152,24 +207,30 @@ async function broadcast(item, type) {
   if (isBroadcasting) return;
   isBroadcasting = true;                 // 同步上鎖，先於任何 await
   markPlayed(type, item.name);
-  ui('broadcastStatus', type === 'pois' ? `播報中：${item.name}` : '播報中：冷知識', 'warn');
+  ui('broadcastStatus', type === 'pois' ? `準備播報：${item.name}` : `準備播報：${item.name}`, 'warn');
   try {
+    // 1. 開場提示音 + 等待 2 秒
     await playAudio($('chime'));
     await sleep(2000);
 
+    // 2. 播報題目（優先播 _q.mp3，若無則念文字）
+    let questionText = item.question || '';
     if (type === 'pois') {
       const labels = ['A', 'B', 'C'];
-      const opts = (item.options || []).map((o, i) => `選項${labels[i]}，${clean(o)}`).join('。');
-      await speak(`${item.question}。${opts}。`);
-    } else {
-      await speak(item.question);        // 冷知識：直接念破冰問句
+      const rawOpts = item.options || [item.optionA, item.optionB, item.optionC].filter(Boolean);
+      const opts = rawOpts.map((o, i) => `選項${labels[i]}，${clean(o)}`).join('。');
+      questionText = `${item.question}。${opts}。`;
     }
+    await playMp3OrSpeak(item.name, 'q', questionText);
 
-    await playAudio($('countdown'), true); // 15 秒倒數音效
+    // 3. 15 秒思考倒數
+    ui('broadcastStatus', `⏳ 思考倒數 15 秒：${item.name}`, 'warn');
+    await playAudio($('countdown'), true);
     await sleep(COUNTDOWN_MS);
     $('countdown').pause();
 
-    await speak(item.answer);   // 解答文本本身已以「答案是…」開頭
+    // 4. 播報解答（優先播 _a.mp3，若無則念文字）
+    await playMp3OrSpeak(item.name, 'a', item.answer || '');
   } catch (e) {
     log('播報中斷：' + e.message);
   } finally {
@@ -213,12 +274,12 @@ function onPosition(pos) {
   if (isBroadcasting) return;
 
   // 優先級 1：主線景點，進入專屬半徑立即觸發
-  const poiHit = poiRank.find(x => x.d <= x.i.radius);
+  const poiHit = poiRank.find(x => x.d <= (x.i.radius || 1.0));
   if (poiHit) return broadcast(poiHit.i, 'pois');
 
   // 優先級 2：冷知識，需通過 3 分鐘冷卻
   if (Date.now() - lastEnd < COOLDOWN_MS) return;
-  const factHit = rank(db.facts, played('facts')).find(x => x.d <= x.i.radius);
+  const factHit = rank(db.facts, played('facts')).find(x => x.d <= (x.i.radius || 5.0));
   if (factHit) broadcast(factHit.i, 'facts');
 }
 
@@ -236,34 +297,37 @@ async function startSystem() {
 async function testBroadcast() {
   if (isBroadcasting) return;
   await unlockMedia();
+  if (!db.pois.length) await loadDB();
   const done = played('pois');
   const pool = db.pois.filter(p => !done.has(p.name));
-  if (!pool.length) return log('沒有未播報的主線景點，請先重置播報進度');
-  broadcast(pool[Math.floor(Math.random() * pool.length)], 'pois');
+  // 優先依序選取第 1 個未播報的景點（確保能直接測到第 1 題的 MP3）；若全數播完則直接測第 1 題
+  const target = pool.length ? pool[0] : db.pois[0];
+  if (!target) return log('題庫目前沒有任何景點資料');
+  broadcast(target, 'pois');
 }
 
 function resetProgress() {
   if (!confirm('確定要清空播報進度？')) return;
+  ttsAudio.pause();
+  if ('speechSynthesis' in window) speechSynthesis.cancel();
   const pref = store.get(VOICE_PREF, null);
   localStorage.clear();
   store.set(KEY.cache, db);   // 清空後立刻補回題庫備援，避免斷線時沒有資料
   if (pref) store.set(VOICE_PREF, pref);   // 保留手動鎖定的語音
   lastEnd = 0;
-  log('播報進度已重置');
+  log('播報進度已重置，下次測試將從第 1 題開始');
 }
 
 /* ---------- 初始化 ---------- */
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
 if ('speechSynthesis' in window) { speechSynthesis.onvoiceschanged = pickVoice; pickVoice(); }
-$('btnStart').addEventListener('click', startSystem);
-$('btnTest').addEventListener('click', testBroadcast);
-$('btnReset').addEventListener('click', resetProgress);
-$('voiceSelect').addEventListener('change', e => {
+$('btnStart').addEventListener('click', startSystem);$('btnTest').addEventListener('click', testBroadcast);
+$('btnReset').addEventListener('click', resetProgress);$('voiceSelect').addEventListener('change', e => {
   const picked = speechSynthesis.getVoices().find(v => v.voiceURI === e.target.value);
   if (!picked) return;
   voice = picked;
   store.set(VOICE_PREF, picked.voiceURI);
-  log(`已鎖定語音：${picked.name}`);
-  if (!isBroadcasting) { speechSynthesis.cancel(); speak('前方一公里有驚喜，準備好了嗎？'); } // 試聽
+  log(`已鎖定備援語音：${picked.name}`);
+  if (!isBroadcasting) { speechSynthesis.cancel(); speak('前方一公里有驚喜，準備好了嗎？'); }
 });
 loadDB();
