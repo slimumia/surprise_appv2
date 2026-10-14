@@ -1,0 +1,48 @@
+name: Generate YunJhe MP3
+
+# 允許在 GitHub 網頁上手動點擊按鈕觸發執行
+on:
+  workflow_dispatch:
+
+# 賦予 GitHub 自動將產出的 MP3 存回專案資料夾的權限
+permissions:
+  contents: write
+
+jobs:
+  build-audio:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. 讀取專案檔案
+        uses: actions/checkout@v4
+
+      - name: 2. 安裝 Python 與 edge-tts 語音套件
+        run: pip install edge-tts
+
+      - name: 3. 執行雲哲 (YunJhe) 語音合成腳本
+        run: |
+          mkdir -p audio
+          python3 - << 'EOF'
+          import asyncio
+          import edge_tts
+
+          # 可調整參數：語音模型與語速
+          VOICE = 'zh-TW-YunJheNeural'
+          RATE = '-5%'
+
+          q_text = '各位時空旅人，當我們的車輛駛離中正紀念堂，轉入愛國東路與金山南路的交界，請留意路旁那段在現代公寓間顯得突兀的高大石牆。現在的這裡，充滿了文青咖啡館與悠閒的綠蔭光影；但在百年前的日本時代，這裡卻是令人心生畏懼的「台北刑務所」，也就是當時台灣規模最大的現代化監獄。想像一下，當年高聳的圍牆內，關押著無數政治犯與抗日烈士，空氣中彷彿還殘留著冷硬的鐵窗氣息、巡警的軍靴聲與沉重的嘆息。牆內外，是截然不同的兩個世界。說到這段沉鬱的過往，為了建造這座固若金湯的監獄，日本人動用了極為特殊的建材。大家不妨猜猜看，這些厚重且充滿歷史刻痕的巨石，究竟是從哪裡運來的呢？選項 A：荷蘭人留下的紅磚。選項 B：拆除的台北府城城牆石。選項 C：陽明山開採的硫磺礦石。'
+          a_text = '答案是 B，拆除的台北府城城牆石。沒錯，當日本政府決定拆除清朝留下的台北城牆以興建三線路時，那些守護城市的城牆石被運到了這裡，重新砌成了禁錮自由的監獄圍牆。昔日抵禦外敵的石頭，成了囚禁靈魂的枷鎖，這無疑是歷史開的一場殘酷玩笑。如今，高牆已倒，只剩這百公尺的遺跡靜靜佇立。下次當您路過這片石牆，看著石縫間鑽出的翠綠蕨類，或許能感受到那份在幽暗歲月中，依然渴望向陽的堅韌生命力。'
+
+          async def main():
+              await edge_tts.Communicate(q_text, VOICE, rate=RATE).save('audio/台北監獄圍牆遺跡（金山南路段）_q.mp3')
+              await edge_tts.Communicate(a_text, VOICE, rate=RATE).save('audio/台北監獄圍牆遺跡（金山南路段）_a.mp3')
+
+          asyncio.run(main())
+          EOF
+
+      - name: 4. 將產出的 MP3 自動存入專案 audio 資料夾
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add audio/*.mp3
+          git diff --staged --quiet || git commit -m "Auto-generate YunJhe MP3 for Question 1"
+          git push
