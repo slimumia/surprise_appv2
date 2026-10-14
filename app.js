@@ -1,7 +1,7 @@
 /* 驚喜製造機 app.js */
 
 // ★ 貼上 Code.gs 部署後的「網頁應用程式網址」（結尾為 /exec）
-const API_URL = 'https://script.google.com/macros/s/XXXXXXXX/exec';
+const API_URL = 'https://script.google.com/macros/s/AKfycbwdOJ2Cve8l2c5WAq65KyyvnpXarwo9N3oDoLhhAFRiRzAMKWh5Q6-nTTXu1W0MWFPABA/exec';
 
 const COOLDOWN_MS = 3 * 60 * 1000;   // 冷知識冷卻：上一次播報結束後 3 分鐘
 const COUNTDOWN_MS = 15 * 1000;      // 思考倒數 15 秒
