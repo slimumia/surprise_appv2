@@ -19,7 +19,12 @@ jobs:
           python-version: '3.10'
       - run: pip install edge-tts requests
 
-      - name: 3. 從 Google Sheets API 抓取題庫並生成 MP3
+      - name: 3. 設定 GitHub 同步權限
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: 4. 抓取題庫並執行「邊轉檔邊上傳」
         run: |
           mkdir -p audio
           python3 - << 'EOF'
@@ -28,6 +33,7 @@ jobs:
           import edge_tts
           import os
           import re
+          import subprocess
 
           # ★★★★ 請將這裡替換為你的 GAS API 網址 ★★★★
           API_URL = "https://script.google.com/macros/s/AKfycbwdOJ2Cve8l2c5WAq65KyyvnpXarwo9N3oDoLhhAFRiRzAMKWh5Q6-nTTXu1W0MWFPABA/exec"
@@ -37,18 +43,49 @@ jobs:
           def clean_opts(opt):
               return re.sub(r'^[A-Cabc][.、\s]+', '', str(opt)).strip()
 
+          # 【機制一】即時上傳函式：每完成一題就同步回 GitHub
+          def commit_and_push(item_name):
+              try:
+                  subprocess.run(['git', 'add', 'audio/*.mp3'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                  res = subprocess.run(['git', 'diff', '--staged', '--quiet'])
+                  if res.returncode != 0:  # 只有當真的有產生新檔案時才執行上傳
+                      subprocess.run(['git', 'commit', '-m', f'Auto-add: {item_name}'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                      subprocess.run(['git', 'push'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                      print(f"☁️ 已將音檔安全備份至 GitHub: {item_name}\n")
+              except Exception as e:
+                  print(f"⚠️ GitHub 同步失敗 ({item_name}): {e}\n")
+
+          # 產出單一音檔函式 (保留斷點續傳與重試機制)
           async def gen_mp3(text, filename):
-              if not text or str(text).strip() in ["", "None", "nan"]: return
+              if not text or str(text).strip() in ["", "None", "nan"]: return False
               filepath = os.path.join("audio", filename)
-              # 生成高品質語音存檔
-              comm = edge_tts.Communicate(str(text), VOICE, rate=RATE)
-              await comm.save(filepath)
-              print(f"✅ 產出音檔: {filename}")
+              
+              if os.path.exists(filepath):
+                  print(f"⏭️ 略過 (已存在): {filename}")
+                  return False
+
+              for attempt in range(3):
+                  try:
+                      comm = edge_tts.Communicate(str(text), VOICE, rate=RATE)
+                      await comm.save(filepath)
+                      print(f"✅ 產出成功: {filename}")
+                      await asyncio.sleep(1) # 禮貌性延遲，避免被微軟阻擋
+                      return True
+                  except Exception as e:
+                      print(f"⚠️ 產出失敗 ({filename}) 第 {attempt+1} 次重試... 錯誤: {e}")
+                      await asyncio.sleep(2)
+              
+              print(f"❌ 放棄產出: {filename}")
+              return False
 
           async def main():
-              print("正在從 API 取得最新題庫...")
-              res = requests.get(API_URL).json()
-              data = res.get("data", {})
+              print("正在從 API 取得最新題庫...\n")
+              try:
+                  res = requests.get(API_URL).json()
+                  data = res.get("data", {})
+              except Exception as e:
+                  print(f"取得 API 失敗: {e}")
+                  return
               
               # 1. 處理主線景點 (POIs)
               for p in data.get("pois", []):
@@ -58,30 +95,28 @@ jobs:
                   opts_text = "。".join([f"選項{chr(65+i)}，{clean_opts(o)}" for i, o in enumerate(opts)])
                   q_text = f"{p.get('question', '')}。{opts_text}。"
                   a_text = re.sub(r'^答案是\s*[A-Cabc][.、\s]*', '答案是：', str(p.get('answer', '')))
-                  await gen_mp3(q_text, f"{name}_q.mp3")
-                  await gen_mp3(a_text, f"{name}_a.mp3")
+                  
+                  q_done = await gen_mp3(q_text, f"{name}_q.mp3")
+                  a_done = await gen_mp3(a_text, f"{name}_a.mp3")
+                  if q_done or a_done: commit_and_push(name)
 
               # 2. 處理點位冷知識 (Facts)
               for f in data.get("facts", []):
                   name = str(f.get("name", "")).strip()
                   if not name: continue
-                  await gen_mp3(f.get("question", ""), f"{name}_q.mp3")
-                  await gen_mp3(f.get("answer", ""), f"{name}_a.mp3")
+                  q_done = await gen_mp3(f.get("question", ""), f"{name}_q.mp3")
+                  a_done = await gen_mp3(f.get("answer", ""), f"{name}_a.mp3")
+                  if q_done or a_done: commit_and_push(name)
 
               # 3. 處理行政區冷知識 (RegionFacts)
               for r in data.get("regionFacts", []):
                   name = str(r.get("name", "")).strip()
                   if not name: continue
-                  await gen_mp3(r.get("question", ""), f"{name}_q.mp3")
-                  await gen_mp3(r.get("answer", ""), f"{name}_a.mp3")
+                  q_done = await gen_mp3(r.get("question", ""), f"{name}_q.mp3")
+                  a_done = await gen_mp3(r.get("answer", ""), f"{name}_a.mp3")
+                  if q_done or a_done: commit_and_push(name)
+
+              print("🎉 所有語音轉檔與同步任務結束！")
 
           asyncio.run(main())
           EOF
-
-      - name: 4. 將生成的 MP3 自動存回 GitHub 專案
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add audio/*.mp3
-          git diff --staged --quiet || git commit -m "Auto-update YunJhe MP3s"
-          git push
