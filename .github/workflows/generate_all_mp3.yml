@@ -1,0 +1,87 @@
+name: 自動生成全站 YunJhe MP3
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-audio:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. 取得最新專案檔案
+        uses: actions/checkout@v4
+
+      - name: 2. 安裝 Python 環境與語音套件
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - run: pip install edge-tts requests
+
+      - name: 3. 從 Google Sheets API 抓取題庫並生成 MP3
+        run: |
+          mkdir -p audio
+          python3 - << 'EOF'
+          import requests
+          import asyncio
+          import edge_tts
+          import os
+          import re
+
+          # ★★★★ 請將這裡替換為你的 GAS API 網址 ★★★★
+          API_URL = "https://script.google.com/macros/s/AKfycbwdOJ2Cve8l2c5WAq65KyyvnpXarwo9N3oDoLhhAFRiRzAMKWh5Q6-nTTXu1W0MWFPABA/exec"
+          VOICE = "zh-TW-YunJheNeural"
+          RATE = "-5%"
+
+          def clean_opts(opt):
+              return re.sub(r'^[A-Cabc][.、\s]+', '', str(opt)).strip()
+
+          async def gen_mp3(text, filename):
+              if not text or str(text).strip() in ["", "None", "nan"]: return
+              filepath = os.path.join("audio", filename)
+              # 生成高品質語音存檔
+              comm = edge_tts.Communicate(str(text), VOICE, rate=RATE)
+              await comm.save(filepath)
+              print(f"✅ 產出音檔: {filename}")
+
+          async def main():
+              print("正在從 API 取得最新題庫...")
+              res = requests.get(API_URL).json()
+              data = res.get("data", {})
+              
+              # 1. 處理主線景點 (POIs)
+              for p in data.get("pois", []):
+                  name = str(p.get("name", "")).strip()
+                  if not name: continue
+                  opts = p.get("options", [])
+                  opts_text = "。".join([f"選項{chr(65+i)}，{clean_opts(o)}" for i, o in enumerate(opts)])
+                  q_text = f"{p.get('question', '')}。{opts_text}。"
+                  a_text = re.sub(r'^答案是\s*[A-Cabc][.、\s]*', '答案是：', str(p.get('answer', '')))
+                  await gen_mp3(q_text, f"{name}_q.mp3")
+                  await gen_mp3(a_text, f"{name}_a.mp3")
+
+              # 2. 處理點位冷知識 (Facts)
+              for f in data.get("facts", []):
+                  name = str(f.get("name", "")).strip()
+                  if not name: continue
+                  await gen_mp3(f.get("question", ""), f"{name}_q.mp3")
+                  await gen_mp3(f.get("answer", ""), f"{name}_a.mp3")
+
+              # 3. 處理行政區冷知識 (RegionFacts)
+              for r in data.get("regionFacts", []):
+                  name = str(r.get("name", "")).strip()
+                  if not name: continue
+                  await gen_mp3(r.get("question", ""), f"{name}_q.mp3")
+                  await gen_mp3(r.get("answer", ""), f"{name}_a.mp3")
+
+          asyncio.run(main())
+          EOF
+
+      - name: 4. 將生成的 MP3 自動存回 GitHub 專案
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add audio/*.mp3
+          git diff --staged --quiet || git commit -m "Auto-update YunJhe MP3s"
+          git push
