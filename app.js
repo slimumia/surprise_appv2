@@ -1,248 +1,195 @@
-/* 驚喜製造機 app.js (支援 YunJhe MP3 優先播放 + 內建 TTS 自動備援) */
+/* 驚喜製造機 app.js (MP3 優先 + 行政區保底引擎) */
 
-// ★ 貼上 Code.gs 部署後的「網頁應用程式網址」（結尾為 /exec）
+// ★ 填入你的 GAS 網址
 const API_URL = 'https://script.google.com/macros/s/AKfycbwdOJ2Cve8l2c5WAq65KyyvnpXarwo9N3oDoLhhAFRiRzAMKWh5Q6-nTTXu1W0MWFPABA/exec';
-
-const AUDIO_DIR = 'audio';           // 存放預錄 MP3 的資料夾名稱
-const COOLDOWN_MS = 3 * 60 * 1000;   // 冷知識冷卻：上一次播報結束後 3 分鐘
+const AUDIO_DIR = 'audio';
+const COOLDOWN_MS = 3 * 60 * 1000;   // 冷知識冷卻：3 分鐘
+const QUIET_MS = 10 * 60 * 1000;     // 大保底冷卻：10 分鐘
 const COUNTDOWN_MS = 15 * 1000;      // 思考倒數 15 秒
-// 越前面權重越高；涵蓋 Apple（Premium/Enhanced/Siri/Mei-Jia）、Edge（Natural/Online）、Chrome（Google 網路語音）
-const VOICE_KEYS = ['Premium', 'Enhanced', 'Siri', 'Natural', 'Neural', 'Online', 'Google', 'Ting-Ting', 'Mei-Jia', 'Meijia', '美佳', '臺灣', '台灣'];
-const VOICE_PREF = 'voice_pref';     // 使用者手動鎖定的語音（voiceURI）
-const KEY = { pois: 'played_pois', facts: 'played_facts', cache: 'offline_cache' };
+
+// 行政區圖資屬性設定
+const COUNTY_KEYS = ['COUNTYNAME', 'countyName', 'county'];
+const TOWN_KEYS = ['TOWNNAME', 'townName', 'town', 'name'];
+
+const VOICE_KEYS = ['Premium', 'Enhanced', 'Siri', 'Natural', 'Neural', 'Online', 'Google', 'Ting-Ting', 'Mei-Jia'];
+const VOICE_PREF = 'voice_pref';
+const KEY = { pois: 'played_pois', facts: 'played_facts', region: 'played_region', cache: 'offline_cache' };
 
 const $ = id => document.getElementById(id);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const log = m => { $('log').textContent = m; };
 const ui = (id, text, state = '') => { const el = $(id); el.textContent = text; el.dataset.s = state; };
 
-let db = { pois: [], facts: [] };
-let isBroadcasting = false;   // 播報鎖，防止多重觸發
-let lastEnd = 0;              // 上一次播報結束時間
+let db = { pois: [], facts: [], regionFacts: [] };
+let isBroadcasting = false, lastEnd = 0, startedAt = 0;
 let voice = null, watchId = null, wakeLock = null, audioCtx = null, started = false;
-window.speechUtterances = []; // 防止長文字被垃圾回收而中斷
+let districts = [], here = null, hereAt = null; // 記錄目前所在行政區
+window.speechUtterances = [];
 
-// 專用預錄 MP3 語音播放器
 const ttsAudio = new Audio();
 ttsAudio.preload = 'auto';
 
 /* ---------- LocalStorage ---------- */
 const store = {
   get(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } },
-  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* 容量滿或無痕模式 */ } }
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
 };
 const played = type => new Set(store.get(KEY[type], []));
 const markPlayed = (type, name) => { const s = played(type); s.add(name); store.set(KEY[type], [...s]); };
 
-/* ---------- 題庫載入（線上優先，失敗用 offline_cache）---------- */
+/* ---------- 載入圖資與題庫 ---------- */
+async function loadDistricts() {
+  try {
+    const gj = await (await fetch('districts.geojson')).json();
+    districts = gj.features.map(f => {
+      const g = f.geometry, polys = g.type === 'Polygon' ? [g.coordinates] : g.coordinates;
+      let x0 = 180, y0 = 90, x1 = -180, y1 = -90;
+      polys.forEach(p => p[0].forEach(([x, y]) => { x0=Math.min(x0,x); x1=Math.max(x1,x); y0=Math.min(y0,y); y1=Math.max(y1,y); }));
+      const norm = s => String(s || '').replace(/台/g, '臺').trim();
+      const pickKey = keys => { for (const k of keys) if (f.properties && f.properties[k]) return String(f.properties[k]); return ''; };
+      return { county: norm(pickKey(COUNTY_KEYS)), town: norm(pickKey(TOWN_KEYS)), bbox: [x0, y0, x1, y1], polys };
+    });
+  } catch (e) { log('未載入行政區圖資'); districts = []; }
+}
+
 async function loadDB() {
   try {
-    if (!API_URL || API_URL.includes('XXXX')) throw new Error('尚未設定 API_URL');
-    const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), 12000);
-    const res = await fetch(API_URL, { signal: ctl.signal });
-    clearTimeout(timer);
+    const res = await fetch(API_URL);
     const json = await res.json();
-    if (json.status !== 'success') throw new Error(json.message || 'API 錯誤');
-    
-    // 自動相容單一陣列或 { pois, facts } 雙工作表結構
-    if (Array.isArray(json.data)) {
-      db = { pois: json.data, facts: [] };
-    } else {
-      db = { pois: json.data.pois || [], facts: json.data.facts || [] };
-    }
+    if (json.status !== 'success') throw new Error(json.message);
+    db = { pois: json.data.pois || [], facts: json.data.facts || [], regionFacts: json.data.regionFacts || [] };
     store.set(KEY.cache, db);
-    ui('dbStatus', `線上 ✓ 景點 ${db.pois.length}／冷知識 ${db.facts.length}`);
+    ui('dbStatus', `線上 ✓ 主線 ${db.pois.length}／冷知識 ${db.facts.length}／行政區 ${db.regionFacts.length}`);
   } catch (e) {
     const cache = store.get(KEY.cache, null);
     if (cache) {
-      db = { pois: cache.pois || [], facts: cache.facts || [] };
-      ui('dbStatus', `離線備援 景點 ${db.pois.length}／冷知識 ${db.facts.length}`, 'warn');
-    } else {
-      ui('dbStatus', '載入失敗：' + e.message, 'err');
-    }
+      db = { pois: cache.pois || [], facts: cache.facts || [], regionFacts: cache.regionFacts || [] };
+      ui('dbStatus', `離線備援 ✓`, 'warn');
+    } else { ui('dbStatus', '載入失敗', 'err'); }
   }
 }
 
-/* ---------- 高音質語音鎖定（作為無 MP3 時的備援語音）---------- */
-function scoreVoice(v) {
-  let s = 0;
-  VOICE_KEYS.forEach((k, i) => { if (v.name.includes(k)) s += 100 - i; });
-  if (/compact/i.test(v.voiceURI)) s -= 50;  // iOS 精簡版音質最差
-  if (!v.localService) s += 20;              // 網路語音通常較自然
-  return s;
-}
-
-function fillVoiceList(list) {
-  const sel = $('voiceSelect');
-  sel.innerHTML = '';
-  list.forEach(v => sel.add(new Option(`${v.name}（${v.lang}）`, v.voiceURI, false, v === voice)));
-}
-
-function pickVoice() {
+/* ---------- 語音解鎖與備援 ---------- */
+function initVoices() {
   if (!('speechSynthesis' in window)) return;
-  const all = speechSynthesis.getVoices();
-  if (!all.length) return;                   // 語音清單尚未載入，等 onvoiceschanged
-  const tw = all.filter(v => /(zh|cmn)[-_]TW/i.test(v.lang));
-  const pool = tw.length ? tw : all.filter(v => /^(zh|cmn)/i.test(v.lang));
-  const saved = store.get(VOICE_PREF, null);
-  voice = all.find(v => v.voiceURI === saved)
-    || [...pool].sort((a, b) => scoreVoice(b) - scoreVoice(a))[0] || null;
-  fillVoiceList(pool.length ? pool : all);
-  log(voice ? `備援語音：${voice.name}（優先播放預錄 MP3）` : '優先播放預錄 MP3（無中文備援語音）');
+  const voices = window.speechSynthesis.getVoices();
+  if (!voices.length) return;
+  const tw = voices.filter(v => /(zh|cmn)[-_]TW/i.test(v.lang));
+  if (tw.length) bestVoice = tw.sort((a, b) => {
+    let sA = 0, sB = 0;
+    VOICE_KEYS.forEach((k, i) => { if(a.name.includes(k)) sA+=100-i; if(b.name.includes(k)) sB+=100-i; });
+    return sB - sA;
+  })[0] || tw[0];
 }
+if ('speechSynthesis' in window) speechSynthesis.onvoiceschanged = initVoices;
 
-/* ---------- 解鎖音訊 / 語音 / 螢幕常亮（必須在點擊事件中呼叫）---------- */
 async function unlockMedia() {
   try {
     audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
-    const resume = audioCtx.resume();
-    const src = audioCtx.createBufferSource();
-    src.buffer = audioCtx.createBuffer(1, 1, 22050);
-    src.connect(audioCtx.destination);
-    src.start(0);
-    await resume;
-  } catch { /* 不支援 Web Audio */ }
-
-  try { // 靜音語音一次，解鎖 Web Speech API
-    const u = new SpeechSynthesisUtterance(' ');
-    u.volume = 0;
-    window.speechUtterances.push(u);
-    speechSynthesis.speak(u);
-  } catch { /* 不支援 TTS */ }
-
-  // 解鎖预錄 MP3 播放器 (ttsAudio) 與背景音效 (chime, countdown)
+    await audioCtx.resume();
+  } catch {}
+  try {
+    const u = new SpeechSynthesisUtterance(' '); u.volume = 0;
+    speechSynthesis.speak(u); setTimeout(initVoices, 100);
+  } catch {}
   try {
     ttsAudio.src = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
-    await ttsAudio.play();
-    ttsAudio.pause();
-  } catch { /* 忽略初始解鎖錯誤 */ }
-
+    await ttsAudio.play(); ttsAudio.pause();
+  } catch {}
   await Promise.all([$('chime'),$('countdown')].map(a => {
     a.muted = true;
     return a.play().then(() => { a.pause(); a.currentTime = 0; }).catch(() => {}).finally(() => { a.muted = false; });
   }));
-  pickVoice();
 }
 
 async function lockScreen() {
-  try {
-    if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen');
-  } catch (e) { log('螢幕常亮失敗：' + e.message); }
+  try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch {}
 }
-document.addEventListener('visibilitychange', () => {
-  if (started && document.visibilityState === 'visible') lockScreen();
-});
 
-/* ---------- 音效 / MP3 優先播報 / TTS 備援 ---------- */
-function playAudio(el, loop = false) {
-  el.loop = loop;
-  el.currentTime = 0;
-  return el.play().catch(() => {});
-}
+/* ---------- 播放引擎 (MP3 優先) ---------- */
+function playAudio(el, loop = false) { el.loop = loop; el.currentTime = 0; return el.play().catch(()=>{}); }
 
 function speak(text) {
   return new Promise(resolve => {
+    if (!('speechSynthesis' in window)) return resolve();
+    speechSynthesis.cancel();
     const u = new SpeechSynthesisUtterance(text);
-    if (!voice) pickVoice();
-    u.lang = voice ? voice.lang : 'zh-TW';
-    if (voice) u.voice = voice;
-    u.rate = 0.92;
-    u.pitch = 1.05;
+    if (bestVoice) u.voice = bestVoice;
+    u.lang = 'zh-TW'; u.rate = 0.92; u.pitch = 1.05;
     window.speechUtterances.push(u);
-    const done = () => {
-      clearTimeout(guard);
-      window.speechUtterances = window.speechUtterances.filter(x => x !== u);
-      resolve();
-    };
+    const done = () => { clearTimeout(guard); window.speechUtterances = window.speechUtterances.filter(x => x !== u); resolve(); };
     const guard = setTimeout(done, text.length * 500 + 8000);
-    u.onend = done;
-    u.onerror = done;
+    u.onend = done; u.onerror = done;
     speechSynthesis.speak(u);
   });
 }
 
-// ★ 核心雙軌播放：優先尋找 audio/<名稱>_<q|a>.mp3，若無檔案則自動切換為 speak() 備援
 function playMp3OrSpeak(itemName, part, fallbackText) {
   return new Promise(resolve => {
-    const fileName = `${ String(itemName).trim() }_${part}.mp3`;
     const mp3Url = `${AUDIO_DIR}/${encodeURIComponent(String(itemName).trim())}_${part}.mp3`;
-
-    const cleanup = () => {
-      ttsAudio.onloadeddata = null;
-      ttsAudio.onended = null;
-      ttsAudio.onerror = null;
-    };
-
-    const fallbackToTTS = async () => {
-      cleanup();
+    const fallback = async () => {
       ui('broadcastStatus', `🗣️ 內建語音：${itemName}`, 'warn');
-      log(`未找到 ${fileName}，已自動切換為內建語音備援`);
-      await speak(fallbackText);
-      resolve();
+      await speak(fallbackText); resolve();
     };
-
-    ttsAudio.onloadeddata = () => {
-      ui('broadcastStatus', `🔊 MP3 播報：${itemName}`, 'warn');
-      log(`正在播放預錄音檔：${fileName}`);
-    };
-
-    ttsAudio.onended = () => {
-      cleanup();
-      resolve();
-    };
-
-    ttsAudio.onerror = fallbackToTTS;
-
+    ttsAudio.onloadeddata = () => { ui('broadcastStatus', `🔊 MP3 播報：${itemName}`, 'warn'); };
+    ttsAudio.onended = () => { ttsAudio.onloadeddata = null; ttsAudio.onended = null; ttsAudio.onerror = null; resolve(); };
+    ttsAudio.onerror = fallback;
     ttsAudio.src = mp3Url;
-    ttsAudio.play().catch(fallbackToTTS);
+    ttsAudio.play().catch(fallback);
   });
 }
 
-// 移除選項開頭的 A. / B、/ c 等字母標籤
 const clean = s => String(s).replace(/^[A-Cabc][.、\s]+/i, '').trim();
 
-/* ---------- 沉浸式廣播劇流程 ---------- */
 async function broadcast(item, type) {
   if (isBroadcasting) return;
-  isBroadcasting = true;                 // 同步上鎖，先於任何 await
+  isBroadcasting = true;
   markPlayed(type, item.name);
-  ui('broadcastStatus', type === 'pois' ? `準備播報：${item.name}` : `準備播報：${item.name}`, 'warn');
+  ui('broadcastStatus', `準備播報：${item.name}`, 'warn');
+  
   try {
-    // 1. 開場提示音 + 等待 2 秒
-    await playAudio($('chime'));
-    await sleep(2000);
+    await playAudio($('chime')); await sleep(2000);
 
-    // 2. 播報題目（優先播 _q.mp3，若無則念文字）
-    let questionText = item.question || '';
+    let qText = item.question || '';
     if (type === 'pois') {
       const labels = ['A', 'B', 'C'];
       const rawOpts = item.options || [item.optionA, item.optionB, item.optionC].filter(Boolean);
       const opts = rawOpts.map((o, i) => `選項${labels[i]}，${clean(o)}`).join('。');
-      questionText = `${item.question}。${opts}。`;
+      qText = `${item.question}。${opts}。`;
     }
-    await playMp3OrSpeak(item.name, 'q', questionText);
+    await playMp3OrSpeak(item.name, 'q', qText);
 
-    // 3. 15 秒思考倒數
-    ui('broadcastStatus', `⏳ 思考倒數 15 秒：${item.name}`, 'warn');
-    await playAudio($('countdown'), true);
-    await sleep(COUNTDOWN_MS);
-    $('countdown').pause();
+    ui('broadcastStatus', `⏳ 思考倒數 15 秒`, 'warn');
+    await playAudio($('countdown'), true); await sleep(COUNTDOWN_MS);$('countdown').pause();
 
-    // 4. 播報解答（優先播 _a.mp3，若無則念文字）
     await playMp3OrSpeak(item.name, 'a', item.answer || '');
-  } catch (e) {
-    log('播報中斷：' + e.message);
-  } finally {
-    $('countdown').pause();
-    isBroadcasting = false;
-    lastEnd = Date.now();                // 冷卻從「播報結束」開始算
+  } catch (e) { log('播報中斷'); } 
+  finally {
+    $('countdown').pause(); isBroadcasting = false; lastEnd = Date.now();
     ui('broadcastStatus', '待命');
   }
 }
 
-/* ---------- GPS ---------- */
-function haversine(lat1, lng1, lat2, lng2) { // 回傳公里
+/* ---------- 行政區與 GPS 判斷 ---------- */
+function inRing(x, y, ring) {
+  let c = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [xi, yi] = ring[i], [xj, yj] = ring[j];
+    if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) c = !c;
+  }
+  return c;
+}
+const inPoly = (x, y, poly) => inRing(x, y, poly[0]) && !poly.slice(1).some(h => inRing(x, y, h));
+const locate = (lat, lng) => districts.find(d => lng >= d.bbox[0] && lng <= d.bbox[2] && lat >= d.bbox[1] && lat <= d.bbox[3] && d.polys.some(p => inPoly(lng, lat, p))) || null;
+
+const norm = s => String(s || '').replace(/台/g, '臺').trim();
+function pickRegion(h) {
+  const done = played('region'), un = db.regionFacts.filter(f => !done.has(f.name));
+  return un.find(f => f.town && norm(f.town) === h.town && norm(f.county) === h.county) || un.find(f => !f.town && f.county && norm(f.county) === h.county) || null;
+}
+const pickGeneric = () => { const done = played('region'); return db.regionFacts.find(f => !f.county && !f.town && !done.has(f.name)) || null; };
+
+function haversine(lat1, lng1, lat2, lng2) {
   const R = 6371, rad = d => d * Math.PI / 180;
   const dLat = rad(lat2 - lat1), dLng = rad(lng2 - lng1);
   const a = Math.sin(dLat / 2) ** 2 + Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(dLng / 2) ** 2;
@@ -254,80 +201,65 @@ function startGPS() {
   if (!navigator.geolocation) return ui('gpsStatus', '此裝置不支援定位', 'err');
   if (watchId !== null) return;
   ui('gpsStatus', '定位中…', 'warn');
-  watchId = navigator.geolocation.watchPosition(onPosition,
-    e => ui('gpsStatus', ({ 1: '定位權限被拒絕', 2: '無法取得位置', 3: '定位逾時' })[e.code] || e.message, 'err'),
-    { enableHighAccuracy: true, maximumAge: 3000, timeout: 20000 });
+  watchId = navigator.geolocation.watchPosition(onPosition, e => ui('gpsStatus', '定位失敗', 'err'), { enableHighAccuracy: true, maximumAge: 3000, timeout: 20000 });
 }
 
 function onPosition(pos) {
   const { latitude: lat, longitude: lng, accuracy } = pos.coords;
-  ui('gpsStatus', `已定位 ±${Math.round(accuracy)} 公尺`);
+  const now = Date.now();
 
-  const rank = (list, done) => list
-    .filter(i => !done.has(i.name))
-    .map(i => ({ i, d: haversine(lat, lng, i.lat, i.lng) }))
-    .sort((a, b) => a.d - b.d);
+  // 判斷目前行政區 (移動超過 300 公尺才重算)
+  if (districts.length && (!hereAt || haversine(hereAt.lat, hereAt.lng, lat, lng) > 0.3)) {
+    here = locate(lat, lng);
+    hereAt = { lat, lng };
+  }
+  ui('gpsStatus', `已定位 ±${Math.round(accuracy)} 公尺${here ? '・' + here.county + here.town : ''}`);
 
+  const rank = (list, done) => list.filter(i => !done.has(i.name)).map(i => ({ i, d: haversine(lat, lng, i.lat, i.lng) })).sort((a, b) => a.d - b.d);
   const poiRank = rank(db.pois, played('pois'));
   $('nextDist').textContent = poiRank.length ? fmtDist(poiRank[0].d) : '主線已全數播完';
 
   if (isBroadcasting) return;
 
-  // 優先級 1：主線景點，進入專屬半徑立即觸發
+  // 優先級 1：主線景點
   const poiHit = poiRank.find(x => x.d <= (x.i.radius || 1.0));
   if (poiHit) return broadcast(poiHit.i, 'pois');
 
-  // 優先級 2：冷知識，需通過 3 分鐘冷卻
-  if (Date.now() - lastEnd < COOLDOWN_MS) return;
+  // 優先級 2：點位冷知識 (需過 3 分鐘冷卻)
+  if (now - lastEnd < COOLDOWN_MS) return;
   const factHit = rank(db.facts, played('facts')).find(x => x.d <= (x.i.radius || 5.0));
-  if (factHit) broadcast(factHit.i, 'facts');
+  if (factHit) return broadcast(factHit.i, 'facts');
+
+  // 優先級 3：行政區冷知識保底
+  if (here) { const r = pickRegion(here); if (r) return broadcast(r, 'region'); }
+
+  // 優先級 4：全域超級大保底 (需過 10 分鐘冷卻)
+  if (now - Math.max(lastEnd, startedAt) >= QUIET_MS) { const g = pickGeneric(); if (g) broadcast(g, 'region'); }
 }
 
 /* ---------- 按鈕 ---------- */
-async function startSystem() {
-  if (started) return;
-  started = true;
-  $('btnStart').disabled = true;
-  $('btnStart').textContent = '系統運行中';
+$('btnStart').addEventListener('click', async () => {
+  if (started) return; started = true; startedAt = Date.now();
+  $('btnStart').disabled = true; $('btnStart').textContent = '系統運行中';
   await Promise.all([unlockMedia(), lockScreen()]);
-  if (!db.pois.length && !db.facts.length) await loadDB();
-  startGPS();
-}
-
-async function testBroadcast() {
-  if (isBroadcasting) return;
-  await unlockMedia();
   if (!db.pois.length) await loadDB();
-  const done = played('pois');
-  const pool = db.pois.filter(p => !done.has(p.name));
-  // 優先依序選取第 1 個未播報的景點（確保能直接測到第 1 題的 MP3）；若全數播完則直接測第 1 題
-  const target = pool.length ? pool[0] : db.pois[0];
-  if (!target) return log('題庫目前沒有任何景點資料');
-  broadcast(target, 'pois');
-}
-
-function resetProgress() {
-  if (!confirm('確定要清空播報進度？')) return;
-  ttsAudio.pause();
-  if ('speechSynthesis' in window) speechSynthesis.cancel();
-  const pref = store.get(VOICE_PREF, null);
-  localStorage.clear();
-  store.set(KEY.cache, db);   // 清空後立刻補回題庫備援，避免斷線時沒有資料
-  if (pref) store.set(VOICE_PREF, pref);   // 保留手動鎖定的語音
-  lastEnd = 0;
-  log('播報進度已重置，下次測試將從第 1 題開始');
-}
-
-/* ---------- 初始化 ---------- */
-if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
-if ('speechSynthesis' in window) { speechSynthesis.onvoiceschanged = pickVoice; pickVoice(); }
-$('btnStart').addEventListener('click', startSystem);$('btnTest').addEventListener('click', testBroadcast);
-$('btnReset').addEventListener('click', resetProgress);$('voiceSelect').addEventListener('change', e => {
-  const picked = speechSynthesis.getVoices().find(v => v.voiceURI === e.target.value);
-  if (!picked) return;
-  voice = picked;
-  store.set(VOICE_PREF, picked.voiceURI);
-  log(`已鎖定備援語音：${picked.name}`);
-  if (!isBroadcasting) { speechSynthesis.cancel(); speak('前方一公里有驚喜，準備好了嗎？'); }
+  startGPS();
 });
+
+$('btnTest').addEventListener('click', async () => {
+  if (isBroadcasting) return; await unlockMedia();
+  if (!db.pois.length) await loadDB();
+  const done = played('pois'), pool = db.pois.filter(p => !done.has(p.name));
+  const target = pool.length ? pool[0] : db.pois[0];
+  if (target) broadcast(target, 'pois');
+});
+
+$('btnReset').addEventListener('click', () => {
+  if (!confirm('確定要清空播報進度？')) return;
+  ttsAudio.pause(); if ('speechSynthesis' in window) speechSynthesis.cancel();
+  localStorage.clear(); store.set(KEY.cache, db); lastEnd = 0;
+  log('進度已重置');
+});
+
 loadDB();
+loadDistricts();
