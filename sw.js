@@ -1,6 +1,6 @@
 // Service Worker：快取 App 外殼，斷線時仍可開啟（題庫備援由 app.js 的 offline_cache 負責）
-const CACHE = 'surprise-machine-v1'; // 更新檔案後請改版本號
-const SHELL = ['./', 'index.html', 'style.css', 'app.js', 'manifest.json',
+const CACHE = 'surprise-machine-v3'; // 更新檔案後請改版本號
+const SHELL = ['./', 'index.html', 'style.css', 'app.js', 'manifest.json', 'districts.geojson',
   'chime.mp3', 'countdown.mp3', 'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', e => {
@@ -14,7 +14,7 @@ self.addEventListener('install', e => {
 self.addEventListener('activate', e => {
   e.waitUntil(
     caches.keys()
-      .then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k))))
+      .then(keys => Promise.all(keys.filter(k => k !== CACHE && !k.startsWith('surprise-audio')).map(k => caches.delete(k))))
       .then(() => self.clients.claim())
   );
 });
