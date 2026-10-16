@@ -1,11 +1,14 @@
-/* 驚喜製造機 app.js (MP3 優先 + 行政區保底引擎) */
+/* 驚喜製造機 app.js (MP3 優先 + 行政區保底引擎 + 動態倒數) */
 
 // ★ 填入你的 GAS 網址
 const API_URL = 'https://script.google.com/macros/s/AKfycbwdOJ2Cve8l2c5WAq65KyyvnpXarwo9N3oDoLhhAFRiRzAMKWh5Q6-nTTXu1W0MWFPABA/exec';
 const AUDIO_DIR = 'audio';
 const COOLDOWN_MS = 3 * 60 * 1000;   // 冷知識冷卻：3 分鐘
 const QUIET_MS = 10 * 60 * 1000;     // 大保底冷卻：10 分鐘
-const COUNTDOWN_MS = 15 * 1000;      // 思考倒數 15 秒
+
+// 💡 新增：依據題型動態設定思考倒數時間 (毫秒)
+// pois (景點有選項) -> 15秒, facts/region (冷知識無選項) -> 10秒
+const WAIT_MS = { pois: 15000, facts: 10000, region: 10000 };
 
 // 行政區圖資屬性設定
 const COUNTY_KEYS = ['COUNTYNAME', 'countyName', 'county'];
@@ -23,7 +26,7 @@ const ui = (id, text, state = '') => { const el = $(id); el.textContent = text; 
 let db = { pois: [], facts: [], regionFacts: [] };
 let isBroadcasting = false, lastEnd = 0, startedAt = 0;
 let voice = null, watchId = null, wakeLock = null, audioCtx = null, started = false;
-let districts = [], here = null, hereAt = null; // 記錄目前所在行政區
+let districts = [], here = null, hereAt = null; 
 window.speechUtterances = [];
 
 const ttsAudio = new Audio();
@@ -148,6 +151,7 @@ async function broadcast(item, type) {
   ui('broadcastStatus', `準備播報：${item.name}`, 'warn');
   
   try {
+    // 1. 播放開場提示音 (chime.mp3)
     await playAudio($('chime')); await sleep(2000);
 
     let qText = item.question || '';
@@ -159,9 +163,14 @@ async function broadcast(item, type) {
     }
     await playMp3OrSpeak(item.name, 'q', qText);
 
-    ui('broadcastStatus', `⏳ 思考倒數 15 秒`, 'warn');
-    await playAudio($('countdown'), true); await sleep(COUNTDOWN_MS);$('countdown').pause();
+    // 💡 2. 動態抓取等待秒數並播放倒數背景音 (countdown.mp3)
+    const waitTime = WAIT_MS[type] || 15000;
+    ui('broadcastStatus', `⏳ 思考倒數 ${waitTime / 1000} 秒`, 'warn');
+    await playAudio($('countdown'), true); 
+    await sleep(waitTime); 
+    $('countdown').pause();
 
+    // 3. 播報解答
     await playMp3OrSpeak(item.name, 'a', item.answer || '');
   } catch (e) { log('播報中斷'); } 
   finally {
@@ -249,9 +258,19 @@ $('btnStart').addEventListener('click', async () => {
 $('btnTest').addEventListener('click', async () => {
   if (isBroadcasting) return; await unlockMedia();
   if (!db.pois.length) await loadDB();
-  const done = played('pois'), pool = db.pois.filter(p => !done.has(p.name));
-  const target = pool.length ? pool[0] : db.pois[0];
-  if (target) broadcast(target, 'pois');
+  
+  // 💡 修改測試邏輯，測試時優先隨機播放一題「點位冷知識」來驗證 10 秒倒數
+  const doneFacts = played('facts');
+  const poolFacts = db.facts.filter(p => !doneFacts.has(p.name));
+  
+  if (poolFacts.length > 0) {
+    broadcast(poolFacts[Math.floor(Math.random() * poolFacts.length)], 'facts');
+  } else {
+    // 找不到冷知識就退回播放景點
+    const donePois = played('pois'), poolPois = db.pois.filter(p => !donePois.has(p.name));
+    const target = poolPois.length ? poolPois[0] : db.pois[0];
+    if (target) broadcast(target, 'pois');
+  }
 });
 
 $('btnReset').addEventListener('click', () => {
