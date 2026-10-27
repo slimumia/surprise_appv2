@@ -1,5 +1,5 @@
 // Service Worker：快取 App 外殼，斷線時仍可開啟（題庫備援由 app.js 的 offline_cache 負責）
-const CACHE = 'surprise-machine-v3'; // 更新檔案後請改版本號
+const CACHE = 'surprise-machine-v4'; // 更新檔案後請改版本號
 const SHELL = ['./', 'index.html', 'style.css', 'app.js', 'manifest.json', 'districts.geojson',
   'chime.mp3', 'countdown.mp3', 'icon-192.png', 'icon-512.png'];
 
