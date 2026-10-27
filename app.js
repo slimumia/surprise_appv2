@@ -25,7 +25,7 @@ const ui = (id, text, state = '') => { const el = $(id); el.textContent = text; 
 
 let db = { pois: [], facts: [], regionFacts: [] };
 let isBroadcasting = false, lastEnd = 0, startedAt = 0;
-let voice = null, watchId = null, wakeLock = null, audioCtx = null, started = false;
+let bestVoice = null, voice = null, watchId = null, wakeLock = null, audioCtx = null, started = false;
 let districts = [], here = null, hereAt = null; 
 window.speechUtterances = [];
 
@@ -130,9 +130,12 @@ function speak(text) {
 function playMp3OrSpeak(itemName, part, fallbackText) {
   return new Promise(resolve => {
     const mp3Url = `${AUDIO_DIR}/${encodeURIComponent(String(itemName).trim())}_${part}.mp3`;
+    let fell = false;
     const fallback = async () => {
+      if (fell) return; fell = true;
+      ttsAudio.onended = ttsAudio.onerror = ttsAudio.onloadeddata = null;
       ui('broadcastStatus', `🗣️ 內建語音：${itemName}`, 'warn');
-      await speak(fallbackText); resolve();
+      try { await speak(fallbackText); } catch {} finally { resolve(); }
     };
     ttsAudio.onloadeddata = () => { ui('broadcastStatus', `🔊 MP3 播報：${itemName}`, 'warn'); };
     ttsAudio.onended = () => { ttsAudio.onloadeddata = null; ttsAudio.onended = null; ttsAudio.onerror = null; resolve(); };
